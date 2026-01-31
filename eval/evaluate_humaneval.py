@@ -17,7 +17,7 @@ def decode(tokens_list, tokenizer, raw_text_len):
     # print(len(tokens_list))
     for tokens in tokens_list:
         tokens = tokens.cpu().numpy().tolist()
-        sent = tokenizer.tokenizer.decode(tokens[raw_text_len:])
+        sent = tokenizer.decode(tokens[raw_text_len:])
         sent = sent.split("<|endoftext|>")[0]
         sent = sent.split("\n\n\n")[0]
         sent = sent.split("\n\n")[0]
@@ -27,7 +27,7 @@ def decode(tokens_list, tokenizer, raw_text_len):
 
 
 def generate_sample(model, tokenizer, input_txt):
-    input_ids = tokenizer.tokenizer.encode(input_txt)
+    input_ids = tokenizer.encode(input_txt)
     raw_text_len = len(input_ids)
     context_enc = torch.tensor([input_ids]).to(model.device)
     print(f"Input text: {input_txt}\n")
@@ -83,3 +83,8 @@ if __name__ == "__main__":
             gen_jobjs = {"task_id": task_id, "completion": gen_sents}
             output.write(gen_jobjs)
     f_output.close()
+
+
+    from human_eval.evaluation import evaluate_functional_correctness
+    results = evaluate_functional_correctness("HumanEval_res.jsonl")
+    print(results)

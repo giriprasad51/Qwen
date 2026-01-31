@@ -387,14 +387,18 @@ def main(args):
     dev_result = {}
     for subject_name in tqdm(TASK_NAME_MAPPING.keys()):
         val_file_path = os.path.join(
-            args.eval_data_path, "val", f"{subject_name}_val.csv"
+            args.eval_data_path,
+            subject_name,
+            "val-00000-of-00001.parquet",
         )
         dev_file_path = os.path.join(
-            args.eval_data_path, "dev", f"{subject_name}_dev.csv"
+           args.eval_data_path,
+            subject_name,
+            "dev-00000-of-00001.parquet",
         )
         # test_file_path = os.path.join(args.eval_data_path, 'test', f'{subject_name}_test.csv')
-        val_df = pd.read_csv(val_file_path)
-        dev_df = pd.read_csv(dev_file_path)
+        val_df = pd.read_parquet(val_file_path)
+        dev_df = pd.read_parquet(dev_file_path)
         # test_df = pd.read_csv(test_file_path)
 
         score = eval_subject(

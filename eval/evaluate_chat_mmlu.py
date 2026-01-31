@@ -28,8 +28,8 @@ def load_models_tokenizer(args):
         args.checkpoint_path,
         device_map="auto",
         trust_remote_code=True,
-        bf16=True,
-        use_flash_attn=True,
+        # bf16=True,
+        # use_flash_attn=True,
     ).eval()
     model.generation_config = GenerationConfig.from_pretrained(
         args.checkpoint_path, trust_remote_code=True

@@ -27,7 +27,7 @@ def decode(tokens_list, tokenizer, raw_text_len):
     # print(len(tokens_list))
     for tokens in tokens_list:
         tokens = tokens.cpu().numpy().tolist()
-        sent = tokenizer.tokenizer.decode(tokens[raw_text_len:])
+        sent = tokenizer.decode(tokens[raw_text_len:])
         sent = sent.split("<|endoftext|>")[0]
         sent = sent.split("\n\n\n")[0]
         sent = sent.split("\n\n")[0]
@@ -37,7 +37,7 @@ def decode(tokens_list, tokenizer, raw_text_len):
 
 
 def generate_sample(model, tokenizer, input_txt):
-    input_ids = tokenizer.tokenizer.encode(input_txt)
+    input_ids = tokenizer.encode(input_txt)
     raw_text_len = len(input_ids)
     context_enc = torch.tensor([input_ids]).to(model.device)
     print(f"Input text: {input_txt}\n")
@@ -87,7 +87,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    fewshot_prompt = open("gsm8k_prompt.txt").read()
+    fewshot_prompt = open("eval/gsm8k_prompt.txt").read()
     if args.sample_input_file is not None:
         dataset = load_from_disk(args.sample_input_file)
     else:
