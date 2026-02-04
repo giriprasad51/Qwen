@@ -12,14 +12,15 @@ from torch.utils.data import Dataset
 from deepspeed import zero
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 import transformers
-from transformers import Trainer, GPTQConfig, deepspeed
+import deepspeed
+from transformers import Trainer,  GPTQConfig
 from transformers.trainer_pt_utils import LabelSmoother
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from accelerate.utils import DistributedType
+from transformers.integrations import is_deepspeed_zero3_enabled
 
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
-
 
 @dataclass
 class ModelArguments:
@@ -109,7 +110,7 @@ def rank0_print(*args):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str, bias="none"):
     """Collects the state dict and dump to disk."""
     # check if zero3 mode enabled
-    if deepspeed.is_deepspeed_zero3_enabled():
+    if is_deepspeed_zero3_enabled():
         state_dict = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
     else:
         if trainer.args.use_lora:
@@ -231,22 +232,65 @@ class LazySupervisedDataset(Dataset):
 
         return ret
 
+class ParallelTextDataset(Dataset):
+    """Loads parallel text files and tokenizes for causal LM training."""
+    
+    def __init__(self, source_file, target_file, tokenizer, max_len):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
 
-def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
-) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    dataset_cls = (
-        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
+        # Read all lines
+        with open(source_file, "r", encoding="utf-8") as f:
+            self.src_lines = [line.strip() for line in f if line.strip()]
+        with open(target_file, "r", encoding="utf-8") as f:
+            self.tgt_lines = [line.strip() for line in f if line.strip()]
+
+        assert len(self.src_lines) == len(self.tgt_lines), "Source and target lengths must match"
+
+    def __len__(self):
+        return len(self.src_lines)
+
+    def __getitem__(self, idx):
+        src_text = self.src_lines[idx]
+        tgt_text = self.tgt_lines[idx]
+
+        # For causal LM, we can concatenate source + target
+        full_text = f"Translate: {src_text}\nAnswer: {tgt_text}"
+
+        encodings = self.tokenizer(
+            full_text,
+            truncation=True,
+            max_length=self.max_len,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
+        input_ids = encodings["input_ids"].squeeze(0)
+        attention_mask = encodings["attention_mask"].squeeze(0)
+
+        # Causal LM labels: same as input_ids
+        labels = input_ids.clone()
+
+        return dict(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+
+def make_supervised_data_module(tokenizer, data_args, max_len):
+    rank0_print("Loading OPUS dataset...")
+
+    train_dataset = ParallelTextDataset(
+        source_file=data_args.data_path + "/train.en",
+        target_file=data_args.data_path + "/train.de",
+        tokenizer=tokenizer,
+        max_len=max_len
     )
-    rank0_print("Loading data...")
-
-    train_json = json.load(open(data_args.data_path, "r"))
-    train_dataset = dataset_cls(train_json, tokenizer=tokenizer, max_len=max_len)
 
     if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
-        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, max_len=max_len)
+        eval_dataset = ParallelTextDataset(
+            source_file=data_args.eval_data_path + "/test.en",
+            target_file=data_args.eval_data_path + "/test.de",
+            tokenizer=tokenizer,
+            max_len=max_len
+        )
     else:
         eval_dataset = None
 
@@ -277,7 +321,7 @@ def train():
     ddp = world_size != 1
     if lora_args.q_lora:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)} if ddp else "auto"
-        if len(training_args.fsdp) > 0 or deepspeed.is_deepspeed_zero3_enabled():
+        if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
             logging.warning(
                 "FSDP or ZeRO3 are incompatible with QLoRA."
             )
@@ -286,13 +330,13 @@ def train():
     if (
             training_args.use_lora
             and not lora_args.q_lora
-            and deepspeed.is_deepspeed_zero3_enabled()
+            and is_deepspeed_zero3_enabled()
             and not is_chat_model
     ):
         raise RuntimeError("ZeRO3 is incompatible with LoRA when finetuning on base model.")
 
     model_load_kwargs = {
-        'low_cpu_mem_usage': not deepspeed.is_deepspeed_zero3_enabled(),
+        'low_cpu_mem_usage': not is_deepspeed_zero3_enabled(),
     }
 
     # Set RoPE scaling factor
@@ -325,7 +369,9 @@ def train():
         use_fast=False,
         trust_remote_code=True,
     )
-    tokenizer.pad_token_id = tokenizer.eod_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token        # set the token string
+        tokenizer.pad_token_id = tokenizer.eos_token_id  # set the corresponding ID
 
     if training_args.use_lora:
         if lora_args.q_lora or is_chat_model:
@@ -361,8 +407,9 @@ def train():
 
     # Start trainner
     trainer = Trainer(
-        model=model, tokenizer=tokenizer, args=training_args, **data_module
+        model=model, args=training_args, **data_module
     )
+    trainer.tokenizer = tokenizer
 
     trainer.train()
     trainer.save_state()

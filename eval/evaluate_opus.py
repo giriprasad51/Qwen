@@ -1,12 +1,11 @@
 import os
 import argparse
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from sacrebleu import corpus_bleu, CHRF
-from tqdm import tqdm
 import random
 import numpy as np
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from sacrebleu import corpus_bleu, CHRF
 
 # -----------------------------
 # UTILITIES
@@ -19,38 +18,91 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 def load_model(checkpoint_path, device):
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_path).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint_path,
+        trust_remote_code=True,
+        padding_side="left"
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint_path,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    ).eval()
+
     return tokenizer, model
 
-def translate_batch(model, tokenizer, texts, device, batch_size=32, max_length=256):
+def make_prompt(src: str) -> str:
+    return (
+        "Translate from German to English.\n\n"
+        f"German: {src.strip()}\n"
+        "English:"
+    )
+
+# -----------------------------
+# TRANSLATION
+# -----------------------------
+def translate_batch(
+    model,
+    tokenizer,
+    texts,
+    device,
+    batch_size=16,
+    max_new_tokens=128,
+):
     outputs = []
+
     for i in tqdm(range(0, len(texts), batch_size)):
-        batch = texts[i:i+batch_size]
-        inputs = tokenizer(batch, return_tensors="pt", padding=True).to(device)
+        batch = texts[i : i + batch_size]
+        prompts = [make_prompt(s) for s in batch]
+
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(device)
+
         with torch.no_grad():
-            preds = model.generate(**inputs, max_length=max_length)
-        decoded = [tokenizer.decode(p, skip_special_tokens=True) for p in preds]
-        outputs.extend(decoded)
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+
+        # remove prompt tokens
+        gen_tokens = generated[:, inputs["input_ids"].shape[1]:]
+        decoded = tokenizer.batch_decode(
+            gen_tokens, skip_special_tokens=True
+        )
+        outputs.extend([d.strip() for d in decoded])
+
     return outputs
 
+# -----------------------------
+# METRICS
+# -----------------------------
 def compute_metrics(hypotheses, references):
     bleu = corpus_bleu(hypotheses, [references]).score
     chrf = CHRF().corpus_score(hypotheses, [references]).score
     return {"BLEU": bleu, "chrF": chrf}
 
+# -----------------------------
+# BENCHMARK
+# -----------------------------
 def benchmark_opus(
     checkpoint_path,
     eval_data_path,
     device="cuda",
-    batch_size=32,
-    max_length=256,
+    batch_size=16,
+    max_new_tokens=128,
     limit=None,
     debug=False,
 ):
     tokenizer, model = load_model(checkpoint_path, device)
 
-    # Expect OPUS dataset files: test.{src}, test.{tgt}
     src_file = os.path.join(eval_data_path, "test.de")
     tgt_file = os.path.join(eval_data_path, "test.en")
 
@@ -64,9 +116,16 @@ def benchmark_opus(
         tgt_lines = tgt_lines[:limit]
 
     if debug:
-        print(f"Loaded {len(src_lines)} examples from {eval_data_path}")
+        print(f"Loaded {len(src_lines)} samples from {eval_data_path}")
 
-    hypotheses = translate_batch(model, tokenizer, src_lines, device, batch_size, max_length)
+    hypotheses = translate_batch(
+        model,
+        tokenizer,
+        src_lines,
+        device,
+        batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+    )
 
     metrics = compute_metrics(hypotheses, tgt_lines)
 
@@ -80,32 +139,48 @@ def benchmark_opus(
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(args.seed)
+
     domains = ["it", "koran", "law", "medical", "subtitles"]
 
     for domain in domains:
-        opus_path = f"{args.eval_data_path}/{domain}"
+        opus_path = os.path.join(args.eval_data_path, domain)
         print(f"\nEvaluating domain: {domain}")
         benchmark_opus(
             checkpoint_path=args.checkpoint_path,
             eval_data_path=opus_path,
             device=device,
             batch_size=args.batch_size,
-        max_length=args.max_seq_len,
-        debug=args.debug,
+            max_new_tokens=args.max_new_tokens,
+            debug=args.debug,
         )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate OPUS dataset with Qwen model")
-    parser.add_argument(
-        "-c", "--checkpoint-path", type=str, default="Qwen/Qwen-7B", help="Model checkpoint"
+    parser = argparse.ArgumentParser(
+        description="Evaluate OPUS DE→EN with causal LLM (Qwen)"
     )
-    parser.add_argument("-s", "--seed", type=int, default=1234, help="Random seed")
 
-    group = parser.add_argument_group(title="Evaluation options")
-    group.add_argument("-d", "--eval_data_path", type=str, required=True, help="Path to eval data")
-    group.add_argument("--max-seq-len", type=int, default=2048, help="Maximum generated tokens")
-    group.add_argument("--debug", action="store_true", default=False, help="Print debug info")
-    group.add_argument("--batch-size", type=int, default=1, help="Batch size for generation")
+    parser.add_argument(
+        "-c",
+        "--checkpoint-path",
+        type=str,
+        default="Qwen/Qwen-7B",
+        help="Model checkpoint",
+    )
+    parser.add_argument("-s", "--seed", type=int, default=1234)
+
+    group = parser.add_argument_group("Evaluation options")
+    group.add_argument(
+        "-d", "--eval_data_path", type=str, required=True
+    )
+    group.add_argument(
+        "--batch-size", type=int, default=16
+    )
+    group.add_argument(
+        "--max-new-tokens", type=int, default=128
+    )
+    group.add_argument(
+        "--debug", action="store_true"
+    )
 
     args = parser.parse_args()
     main(args)

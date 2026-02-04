@@ -1,4 +1,6 @@
 #!/bin/bash
+export CUDA_VISIBLE_DEVICES=0,2,3
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 DIR=`pwd`
 
@@ -69,11 +71,11 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --data_path $DATA \
     --bf16 True \
     --output_dir output_qwen \
-    --num_train_epochs 5 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
-    --evaluation_strategy "no" \
+    --do_eval False \
     --save_strategy "steps" \
     --save_steps 1000 \
     --save_total_limit 10 \
